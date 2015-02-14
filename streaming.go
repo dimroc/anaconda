@@ -7,9 +7,9 @@ import (
 	"math/rand"
 	"net/http"
 	"net/url"
-	"sync"
 	"time"
 
+	"github.com/azr/goupille"
 	"github.com/dustin/go-jsonpointer"
 )
 
@@ -143,34 +143,41 @@ type TooManyFollow struct {
 // When finished streaming you call stream.Interrupt() to initiate termination process.
 // Then call stream.End() if you want your to wait until everything is closed.
 //
-
+// Usage :
+// 1. start streaming with : `stream := api.PublicStreamFilter(...)`
+//
+// 1.5 (optional) get stream to end on sig notifications : `stream.Goupille.Notify(os.Interrupt syscall.SIGTERM)`
+//
+// 2. go loop on `o, hasMore:= <-stream.C`
+//
+// 2.5 don't forget to leave when `hasMore == false`
+//
+// 3. wait until stream terminates with `terminationReason := stream.Wait()` (in main for example)
+//
 type Stream struct {
-	api       TwitterApi
-	C         chan interface{}
-	Quit      chan bool
-	waitGroup sync.WaitGroup
-	Stats     StreamStats
+	api      TwitterApi
+	C        chan interface{}
+	Goupille *goupille.Pin
+	Stats    StreamStats
 }
 
 // Interrupt starts the finishing sequence
-func (s *Stream) Interrupt() {
-	s.api.Log.Notice("Stream closing...")
-	close(s.Quit)
-	s.api.Log.Debug("Stream closed.")
+func (s *Stream) Interrupt(reason error) {
+	s.api.Log.Criticalf("Stream closing (%s)...", reason)
+	s.Goupille.Pull(reason)
 }
 
-//End wait for closability
-func (s *Stream) End() {
-	s.waitGroup.Wait()
-	close(s.C)
+//Wait for closure
+func (s *Stream) Wait() error {
+	return s.Goupille.Wait()
 }
 
 func (s *Stream) listen(response http.Response) {
+	s.api.Log.Notice("Listenning to twitter socket")
 	s.Stats.Listened()
 	defer s.Stats.Disconnected()
 	defer response.Body.Close()
 
-	s.api.Log.Notice("Listenning to twitter socket")
 	scanner := bufio.NewScanner(response.Body)
 	for {
 		if ok := scanner.Scan(); !ok {
@@ -179,7 +186,7 @@ func (s *Stream) listen(response http.Response) {
 		}
 
 		select {
-		case <-s.Quit:
+		case <-s.Goupille.Tick():
 			s.api.Log.Debug("leaving response loop")
 			return
 		default:
@@ -246,8 +253,13 @@ func (s *Stream) requestStream(urlStr string, v url.Values, method int) (resp *h
 }
 
 func (s *Stream) loop(urlStr string, v url.Values, method int) {
-	defer s.api.Log.Debug("Leaving request stream loop")
-	defer s.waitGroup.Done()
+	s.Goupille.Add()
+	defer s.Goupille.Done()
+	defer s.api.Log.Notice("Left request stream loop")
+
+	// As loop will be the only one publishing to chan
+	// if loop returns, chan is worthless
+	defer close(s.C)
 
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	baseBackoff := time.Duration(2 * time.Second)
@@ -255,8 +267,7 @@ func (s *Stream) loop(urlStr string, v url.Values, method int) {
 	backoff := baseBackoff
 	for {
 		select {
-		case <-s.Quit:
-			s.api.Log.Notice("leaving stream loop")
+		case <-s.Goupille.Tick():
 			return
 		default:
 
@@ -268,9 +279,8 @@ func (s *Stream) loop(urlStr string, v url.Values, method int) {
 					// right away with EOF as of a rate limit
 					resp.StatusCode = 420
 				} else {
-					s.api.Log.Criticalf("Cannot request stream : %s", err)
-					s.Quit <- true
-					// trigger quit but donnot close chan
+					err = fmt.Errorf("Cannot request stream : %s", err)
+					s.Interrupt(err)
 					return
 				}
 			}
@@ -287,8 +297,8 @@ func (s *Stream) loop(urlStr string, v url.Values, method int) {
 				s.api.Log.Debugf("backing off %s", backoff)
 				time.Sleep(backoff)
 			case 400, 401, 403, 404, 406, 410, 422, 500, 502, 504:
-				s.api.Log.Criticalf("Twitter streaming: leaving after an irremediable error: %+s", resp.Status)
-				s.Quit <- true
+				err = fmt.Errorf("Twitter streaming: leaving after an irremediable error: %+s", resp.Status)
+				s.Interrupt(err)
 				// trigger quit but donnot close chan
 				return
 			default:
@@ -300,20 +310,18 @@ func (s *Stream) loop(urlStr string, v url.Values, method int) {
 }
 
 func (s *Stream) Start(urlStr string, v url.Values, method int) {
-	s.waitGroup.Add(1)
 	go s.loop(urlStr, v, method)
 }
 
 func (a TwitterApi) newStream(urlStr string, v url.Values, method int) *Stream {
-	stream := Stream{
-		api:       a,
-		Quit:      make(chan bool),
-		C:         make(chan interface{}),
-		waitGroup: sync.WaitGroup{},
-		Stats:     StreamStats{},
+	stream := &Stream{
+		api:      a,
+		C:        make(chan interface{}),
+		Stats:    StreamStats{},
+		Goupille: goupille.New(),
 	}
 	stream.Start(urlStr, v, method)
-	return &stream
+	return stream
 }
 
 func (a TwitterApi) UserStream(v url.Values) (stream *Stream) {
