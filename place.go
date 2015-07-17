@@ -1,7 +1,5 @@
 package anaconda
 
-import "net/url"
-
 type Place struct {
 	Attributes  map[string]string `json:"attributes"`
 	BoundingBox struct {
